@@ -3,4 +3,5 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
-capstone_pharmacy.db
+capstone_pharmacy_FULL.db
+slim_db.py
