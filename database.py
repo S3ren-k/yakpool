@@ -68,6 +68,14 @@ class DisposalBin(Base):
     latitude = Column(Float)  # 위도 (지도 표시용)
     longitude = Column(Float)  # 경도 (지도 표시용)
 
+# 6. 병용금기 테이블
+class Interaction(Base):
+    __tablename__ = "interactions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    item_a_name = Column(String(200))  # 약 A 이름
+    item_b_name = Column(String(200))  # 약 B 이름
+    prohibit_content = Column(Text)     # 병용금기 사유
 
 # 5. 복약 알림 테이블
 class Alarm(Base):
