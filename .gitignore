@@ -1,7 +1,33 @@
 venv/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.venv/
+env/
 .env
 .DS_Store
+
+# database
+*.db
+*.sqlite
+*.sqlite3
 capstone_pharmacy_FULL.db
 slim_db.py
+
+# logs
+*.log
+
+# local tools
+.claude/
+
+# backups
+백업/
+
+# IDE
+.vscode/
+.idea/
+
+# generated/exported files
+*.csv
+*.html
