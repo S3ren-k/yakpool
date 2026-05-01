@@ -2,11 +2,12 @@ from sqlalchemy import create_engine, Column, Integer, String, Text, Float, Bool
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 from datetime import datetime
 from pathlib import Path
+import os
 
 # 1. DB 연결 설정 (일단 연습하기 가장 편한 SQLite로 설정)
 # 나중에 MySQL로 바꿀 때는 이 주소만 'mysql+pymysql://아이디:비번@주소/db이름'으로 바꾸면 돼!
-DB_PATH = Path(__file__).resolve().parent / "backend-prototype" / "capstone_pharmacy.db"
-SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_PATH.as_posix()}"
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "capstone_pharmacy.db")
+SQLALCHEMY_DATABASE_URL = f"sqlite:///{DB_PATH}"
 engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
