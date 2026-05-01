@@ -1,9 +1,8 @@
 fastapi
 uvicorn
-sqlalchemy
-pandas
-requests
-passlib[bcrypt]
-httpx
 python-multipart
 python-dotenv
+requests
+sqlalchemy
+google-cloud-speech
+google-cloud-texttospeech

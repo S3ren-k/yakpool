@@ -9,10 +9,10 @@ import requests
 from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, File, Request, UploadFile
 from fastapi.responses import JSONResponse, Response
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 from sqlalchemy.orm import Session
 
-from database import Medicine, SessionLocal
+from database import Interaction, Medicine, SessionLocal
 
 
 router = APIRouter()
@@ -27,6 +27,11 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini").strip()
 GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
 GOOGLE_CLOUD_API_KEY = (
     os.getenv("GOOGLE_CLOUD_API_KEY", "").strip() or GOOGLE_VISION_API_KEY
+)
+VISION_API_URL = (
+    f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
+    if GOOGLE_VISION_API_KEY
+    else ""
 )
 GOOGLE_STT_LANGUAGE = os.getenv("GOOGLE_STT_LANGUAGE", "ko-KR").strip()
 GOOGLE_TTS_LANGUAGE = os.getenv("GOOGLE_TTS_LANGUAGE", "ko-KR").strip()
@@ -54,6 +59,25 @@ STOPWORDS = {
     "얼마나",
 }
 
+REQUEST_SUFFIXES = (
+    "설명해줘",
+    "설명해주세요",
+    "설명",
+    "알려줘",
+    "알려주세요",
+    "궁금해",
+    "궁금합니다",
+    "뭐야",
+    "무엇",
+    "효능",
+    "효과",
+    "복용법",
+    "주의사항",
+    "부작용",
+    "보관방법",
+    "정보",
+)
+
 KOREAN_PARTICLES = (
     "이에요",
     "예요",
@@ -77,6 +101,16 @@ KOREAN_PARTICLES = (
 )
 
 
+def clean_search_term(term):
+    term = (term or "").strip()
+    for suffix in REQUEST_SUFFIXES:
+        if term.endswith(suffix) and len(term) > len(suffix) + 1:
+            term = term[: -len(suffix)]
+            break
+    term = strip_korean_particle(term)
+    return term.strip()
+
+
 def get_db():
     db = SessionLocal()
     try:
@@ -89,11 +123,13 @@ def extract_search_terms(message):
     terms = re.findall(r"[가-힣A-Za-z0-9]+", message)
     cleaned = []
     for term in terms:
-        term = term.strip()
+        term = clean_search_term(term)
         if len(term) < 2 or term in STOPWORDS:
             continue
+        if any(term == suffix for suffix in REQUEST_SUFFIXES):
+            continue
         cleaned.append(term)
-        stripped = strip_korean_particle(term)
+        stripped = clean_search_term(term)
         if stripped != term and len(stripped) >= 2 and stripped not in STOPWORDS:
             cleaned.append(stripped)
     return cleaned[:8]
@@ -132,6 +168,12 @@ def fuzzy_score(term, medicine_name):
             best = max(best, 88)
         else:
             best = max(best, int(difflib.SequenceMatcher(None, normalized_term, variant).ratio() * 100))
+            term_len = len(normalized_term)
+            if len(variant) >= term_len:
+                for size in {term_len, min(term_len + 1, len(variant))}:
+                    for start in range(0, len(variant) - size + 1):
+                        chunk = variant[start : start + size]
+                        best = max(best, int(difflib.SequenceMatcher(None, normalized_term, chunk).ratio() * 100))
     return best
 
 
@@ -181,7 +223,7 @@ def find_medicine_from_db(db, message):
         scored = []
         for medicine in all_medicines:
             score_value = max(fuzzy_score(term, medicine.item_name or "") for term in terms)
-            if score_value >= 72:
+            if score_value >= 65:
                 scored.append((score_value, medicine))
         if not scored:
             return None
@@ -232,6 +274,152 @@ def medicine_to_context(medicine):
         "storage": medicine.deposit_method or "DB에 등록된 보관법 정보가 없습니다.",
         "image_url": medicine.image_url,
     }
+
+
+INTERACTION_KEYWORDS = (
+    "같이",
+    "함께",
+    "동시에",
+    "병용",
+    "금기",
+    "상호작용",
+    "안되는",
+    "안 되는",
+)
+
+
+def is_interaction_question(message):
+    if any(keyword in message for keyword in INTERACTION_KEYWORDS):
+        return True
+    return "먹어도" in message and any(marker in message for marker in ("이랑", "랑", "와", "과", "하고"))
+
+
+def normalize_interaction_name(text):
+    return re.sub(r"[^가-힣A-Za-z0-9]", "", (text or "")).lower()
+
+
+def clean_interaction_candidate(text):
+    candidate = re.sub(r"[^가-힣A-Za-z0-9]", "", (text or "")).strip()
+    for suffix in ("이랑은", "이랑", "랑은", "하고는", "하고", "와는", "과는", "으로", "로", "은", "는", "이", "가", "을", "를", "랑", "와", "과"):
+        if candidate.endswith(suffix) and len(candidate) > len(suffix) + 1:
+            candidate = candidate[: -len(suffix)]
+            break
+    return candidate
+
+
+def extract_interaction_names_fallback(message):
+    cleaned = re.sub(r"(같이|함께|동시에|먹어도|먹으면|먹는|먹을|안되는|안 되는|약|있을까|되나|돼|되나요|될까|금기|병용|상호작용)", " ", message)
+    candidates = re.findall(r"[가-힣A-Za-z0-9]+", cleaned)
+    cleaned_candidates = []
+    for candidate in candidates:
+        candidate = clean_interaction_candidate(candidate)
+        if len(candidate) >= 2 and candidate not in cleaned_candidates:
+            cleaned_candidates.append(candidate)
+    return cleaned_candidates[:3]
+
+
+def extract_interaction_medicine_names_with_ai(user_message):
+    prompt = (
+        "사용자 질문에서 의약품 이름만 추출하세요.\n"
+        "질문이 'A랑 B 같이 먹어도 돼?'이면 A와 B를 모두 추출하세요.\n"
+        "질문이 'A랑 같이 먹으면 안 되는 약이 있을까?'이면 A만 추출하세요.\n"
+        "반드시 JSON만 반환하세요.\n\n"
+        f"사용자 질문: {user_message}\n\n"
+        '{"medicines": []}'
+    )
+    raw = call_openai([{"role": "user", "content": prompt}], max_tokens=160)
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    data = json.loads(raw)
+    names = data.get("medicines") or []
+    return [str(name).strip() for name in names if str(name).strip()]
+
+
+def extract_interaction_medicine_names(user_message):
+    try:
+        names = extract_interaction_medicine_names_with_ai(user_message)
+    except Exception:
+        names = []
+    if not names:
+        names = extract_interaction_names_fallback(user_message)
+    return [clean_interaction_candidate(name) for name in names if clean_interaction_candidate(name)][:3]
+
+
+def interaction_to_context(row):
+    return {
+        "drug_a": row.item_a_name,
+        "drug_b": row.item_b_name,
+        "reason": row.prohibit_content or "DB에 구체적인 금기 사유가 없습니다.",
+        "category": row.category or "병용금기",
+        "target_group": row.target_group or "전체",
+    }
+
+
+def find_interaction_rows(db, names, limit=12):
+    normalized = [normalize_interaction_name(name) for name in names if normalize_interaction_name(name)]
+    if not normalized:
+        return []
+
+    if len(normalized) >= 2:
+        first, second = normalized[0], normalized[1]
+        filters = [
+            and_(Interaction.simplified_a.ilike(f"%{first}%"), Interaction.simplified_b.ilike(f"%{second}%")),
+            and_(Interaction.simplified_a.ilike(f"%{second}%"), Interaction.simplified_b.ilike(f"%{first}%")),
+            and_(Interaction.item_a_name.ilike(f"%{names[0]}%"), Interaction.item_b_name.ilike(f"%{names[1]}%")),
+            and_(Interaction.item_a_name.ilike(f"%{names[1]}%"), Interaction.item_b_name.ilike(f"%{names[0]}%")),
+        ]
+        return db.query(Interaction).filter(or_(*filters)).limit(limit).all()
+
+    name = normalized[0]
+    original = names[0]
+    return (
+        db.query(Interaction)
+        .filter(
+            or_(
+                Interaction.simplified_a.ilike(f"%{name}%"),
+                Interaction.simplified_b.ilike(f"%{name}%"),
+                Interaction.item_a_name.ilike(f"%{original}%"),
+                Interaction.item_b_name.ilike(f"%{original}%"),
+            )
+        )
+        .limit(limit)
+        .all()
+    )
+
+
+def make_interaction_ai_answer(user_message, names, interaction_rows):
+    facts = [interaction_to_context(row) for row in interaction_rows]
+    system_msg = {
+        "role": "system",
+        "content": (
+            "당신은 고령자도 이해하기 쉽게 설명하는 약국 AI 챗봇입니다. "
+            "반드시 제공된 병용금기 DB 검색 결과만 근거로 답하세요. "
+            "DB에 없는 조합이나 사유를 추측하지 마세요. "
+            "의학적 최종 판단이나 처방 변경 지시는 하지 말고, 위험 가능성이 있으면 의사 또는 약사 상담을 권하세요. "
+            "ACTIONS, JSON, 코드블록은 출력하지 마세요."
+        ),
+    }
+    if facts:
+        user_content = (
+            f"사용자 질문: {user_message}\n"
+            f"추출된 약 이름: {', '.join(names) if names else '없음'}\n\n"
+            "병용금기 DB 검색 결과:\n"
+            f"{json.dumps(facts, ensure_ascii=False, indent=2)}\n\n"
+            "답변 형식:\n"
+            "[확인 결과] : 같이 먹어도 되는지 한 문장으로 말하세요.\n\n"
+            "[주의 이유] : DB의 금기 사유를 쉬운 말로 설명하세요.\n\n"
+            "[안내] : 이미 같이 복용했거나 복용 예정이면 의사 또는 약사에게 확인하라고 안내하세요."
+        )
+    else:
+        user_content = (
+            f"사용자 질문: {user_message}\n"
+            f"추출된 약 이름: {', '.join(names) if names else '없음'}\n\n"
+            "병용금기 DB 검색 결과: 없음\n\n"
+            "답변 형식:\n"
+            "[확인 결과] : 현재 DB에서 해당 병용금기 정보를 찾지 못했다고 말하세요.\n\n"
+            "[주의] : DB에 없다고 안전이 확정되는 것은 아니라고 짧게 말하세요.\n\n"
+            "[안내] : 정확한 복용 가능 여부는 의사 또는 약사에게 확인하라고 안내하세요."
+        )
+    return clean_chat_response(call_openai([system_msg, {"role": "user", "content": user_content}], max_tokens=650))
 
 
 def get_stt_phrase_hints(db=None):
@@ -343,6 +531,90 @@ def clean_chat_response(text):
     return cleaned
 
 
+_MEAL_KO = {
+    "after meal": "식후",
+    "after meals": "식후",
+    "after eating": "식후",
+    "before meal": "식전",
+    "before meals": "식전",
+    "before eating": "식전",
+    "with meal": "식중",
+    "with meals": "식중",
+    "with food": "식중",
+    "regardless of meal": "식사 무관",
+    "any time": "식사 무관",
+}
+_GAP_KO = {
+    "30 minutes": "30분 후",
+    "30 mins": "30분 후",
+    "30 min": "30분 후",
+    "15 minutes": "15분 후",
+    "15 mins": "15분 후",
+    "1 hour": "1시간 후",
+    "immediately": "즉시",
+    "right away": "즉시",
+}
+_DOSE_KO = {
+    "1 tablet": "1정",
+    "2 tablets": "2정",
+    "3 tablets": "3정",
+    "1 capsule": "1캡슐",
+    "2 capsules": "2캡슐",
+    "1 pack": "1포",
+    "2 packs": "2포",
+    "half tablet": "0.5정",
+    "half a tablet": "0.5정",
+}
+
+
+def normalize_drug_fields(drug):
+    for field, mapping in [("meal", _MEAL_KO), ("gap", _GAP_KO), ("dose", _DOSE_KO)]:
+        value = (drug.get(field) or "").strip()
+        if value.lower() in mapping:
+            drug[field] = mapping[value.lower()]
+    return drug
+
+
+def parse_drugs_from_ocr(ocr_text):
+    prompt = f"""
+다음은 한국어 약봉지 또는 처방전 OCR 텍스트입니다.
+텍스트에 있는 약 이름과 복약 정보를 찾아 JSON만 반환하세요.
+
+반환 형식:
+{{
+  "drugs": [
+    {{
+      "name": "OCR에 실제로 나온 약 이름",
+      "times": ["08:00"],
+      "dose": "1정",
+      "meal": "식후",
+      "gap": "30분 후",
+      "days": [1, 2, 3, 4, 5],
+      "memo": ""
+    }}
+  ]
+}}
+
+규칙:
+- name에는 OCR text에 실제로 등장하는 약 이름만 넣으세요. 반환 형식의 예시 문구를 약 이름으로 복사하지 마세요.
+- 병원명, 약국명, 환자명, 날짜, 주소, 전화번호는 제외하세요.
+- 시간은 24시간 HH:MM 형식으로 반환하세요.
+- 복용 정보가 없으면 times는 ["08:00"], dose는 "1정", meal은 "식후", gap은 "30분 후"로 설정하세요.
+- 약을 찾지 못한 경우에만 drugs를 빈 배열로 반환하세요.
+- 모든 필드 값은 한국어로 반환하세요. 영어를 쓰지 마세요.
+  예: dose "1 tablet" 금지, 반드시 "1정"
+  예: meal "after meal" 금지, 반드시 "식후"
+  예: gap "30 minutes" 금지, 반드시 "30분 후"
+
+OCR text:
+{ocr_text}
+"""
+    raw = call_openai([{"role": "user", "content": prompt}], max_tokens=800)
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    parsed = json.loads(raw)
+    return [normalize_drug_fields(drug) for drug in parsed.get("drugs", [])]
+
+
 def get_google_speech_encoding(content_type):
     from google.cloud import speech
 
@@ -446,6 +718,30 @@ async def chat(request: Request, db: Session = Depends(get_db)):
     if not user_message:
         return {"response": "메시지를 입력해주세요."}
 
+    if is_interaction_question(user_message):
+        names = extract_interaction_medicine_names(user_message)
+        interaction_rows = find_interaction_rows(db, names)
+        try:
+            response = make_interaction_ai_answer(user_message, names, interaction_rows)
+        except Exception as e:
+            return {
+                "response": (
+                    "병용금기 DB 검색은 완료했지만 AI 답변 생성에 실패했어요.\n\n"
+                    "OpenAI API 키와 네트워크 연결을 확인해 주세요."
+                ),
+                "source": "interaction_openai_error",
+                "error": str(e),
+                "extracted_medicine_names": names,
+                "interactions": [interaction_to_context(row) for row in interaction_rows],
+            }
+
+        return {
+            "response": response,
+            "source": "interaction_with_db",
+            "extracted_medicine_names": names,
+            "interactions": [interaction_to_context(row) for row in interaction_rows],
+        }
+
     medicine, extracted_name = find_medicine_for_question(db, user_message)
     if not medicine:
         return {
@@ -475,6 +771,54 @@ async def chat(request: Request, db: Session = Depends(get_db)):
         "extracted_medicine_name": extracted_name,
         "medicine": medicine_to_context(medicine),
     }
+
+
+@router.post("/analyze-image")
+async def analyze_image(image: UploadFile = File(...)):
+    if not VISION_API_URL:
+        return JSONResponse({"error": ".env에 GOOGLE_VISION_API_KEY가 설정되어 있지 않습니다."}, status_code=500)
+
+    image_data = await image.read()
+    if not image_data:
+        return JSONResponse({"error": "이미지 파일이 비어 있습니다."}, status_code=400)
+
+    vision_res = requests.post(
+        VISION_API_URL,
+        json={
+            "requests": [
+                {
+                    "image": {"content": base64.b64encode(image_data).decode("utf-8")},
+                    "features": [{"type": "TEXT_DETECTION"}],
+                    "imageContext": {"languageHints": ["ko", "en"]},
+                }
+            ]
+        },
+        timeout=30,
+    )
+    if not vision_res.ok:
+        return JSONResponse(
+            {"error": f"Google Vision error: {sanitize_google_error(vision_res.text)}"},
+            status_code=502,
+        )
+
+    try:
+        annotations = vision_res.json()["responses"][0].get("textAnnotations", [])
+    except (KeyError, IndexError):
+        return JSONResponse({"error": "OCR 응답을 읽지 못했습니다."}, status_code=502)
+
+    if not annotations:
+        return {"drugs": [], "message": "사진에서 텍스트를 인식하지 못했습니다."}
+
+    ocr_text = annotations[0].get("description", "")
+    try:
+        return {"drugs": parse_drugs_from_ocr(ocr_text), "ocr_text": ocr_text}
+    except json.JSONDecodeError:
+        return JSONResponse(
+            {"error": "AI 응답을 JSON으로 해석하지 못했습니다.", "ocr_text": ocr_text},
+            status_code=502,
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e), "ocr_text": ocr_text}, status_code=500)
 
 
 @router.post("/stt")

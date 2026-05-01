@@ -8,7 +8,7 @@ import sys
 
 import requests
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import or_
@@ -25,7 +25,7 @@ if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip():
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
-from database import Base, Medicine, SessionLocal, engine  # noqa: E402
+from database import Base, DisposalBin, Medicine, SessionLocal, engine  # noqa: E402
 
 
 app = FastAPI()
@@ -50,6 +50,7 @@ FRONTEND_FILE = os.getenv("FRONTEND_FILE", "yakpool_app_v15.html").strip()
 GOOGLE_STT_LANGUAGE = os.getenv("GOOGLE_STT_LANGUAGE", "ko-KR").strip()
 GOOGLE_TTS_LANGUAGE = os.getenv("GOOGLE_TTS_LANGUAGE", "ko-KR").strip()
 GOOGLE_TTS_VOICE = os.getenv("GOOGLE_TTS_VOICE", "ko-KR-Standard-A").strip()
+KAKAO_MAPS_API_KEY = os.getenv("KAKAO_MAPS_API_KEY", "").strip()
 
 VISION_API_URL = (
     f"https://vision.googleapis.com/v1/images:annotate?key={GOOGLE_VISION_API_KEY}"
@@ -106,9 +107,12 @@ KOREAN_PARTICLES = (
 @app.get("/")
 def index():
     frontend_path = BASE_DIR / FRONTEND_FILE
-    if frontend_path.exists():
-        return FileResponse(frontend_path)
-    return {"message": "ai server is running", "frontend_file": f"{FRONTEND_FILE} not found"}
+    if not frontend_path.exists():
+        return {"message": "ai server is running", "frontend_file": f"{FRONTEND_FILE} not found"}
+    html = frontend_path.read_text(encoding="utf-8")
+    html = html.replace("__KAKAO_MAPS_API_KEY__", KAKAO_MAPS_API_KEY)
+    html = html.replace("__API_BASE_URL__", "")
+    return Response(content=html, media_type="text/html")
 
 
 def fmt_time_korean(t):
@@ -151,6 +155,34 @@ def call_openai(messages, max_tokens=500):
     return res.json()["choices"][0]["message"]["content"].strip()
 
 
+_MEAL_KO = {
+    "after meal": "식후", "after meals": "식후", "after eating": "식후",
+    "before meal": "식전", "before meals": "식전", "before eating": "식전",
+    "with meal": "식중", "with meals": "식중", "with food": "식중",
+    "regardless of meal": "식사 무관", "any time": "식사 무관",
+}
+_GAP_KO = {
+    "30 minutes": "30분 후", "30 mins": "30분 후", "30 min": "30분 후",
+    "15 minutes": "15분 후", "15 mins": "15분 후",
+    "1 hour": "1시간 후", "immediately": "즉시", "right away": "즉시",
+}
+_DOSE_KO = {
+    "1 tablet": "1정", "2 tablets": "2정", "3 tablets": "3정",
+    "1 capsule": "1캡슐", "2 capsules": "2캡슐",
+    "1 pack": "1포", "2 packs": "2포",
+    "half tablet": "0.5정", "half a tablet": "0.5정",
+}
+
+
+def _normalize_drug_fields(drug):
+    for field, mapping in [("meal", _MEAL_KO), ("gap", _GAP_KO), ("dose", _DOSE_KO)]:
+        val = (drug.get(field) or "").strip()
+        lower = val.lower()
+        if lower in mapping:
+            drug[field] = mapping[lower]
+    return drug
+
+
 def _parse_drugs(ocr_text):
     """OCR text -> alarm drug array."""
     prompt = f"""
@@ -161,7 +193,7 @@ def _parse_drugs(ocr_text):
 {{
   "drugs": [
     {{
-      "name": "타이레놀 500mg",
+      "name": "OCR에 실제로 나온 약 이름",
       "times": ["08:00", "12:00", "18:00"],
       "dose": "1정",
       "meal": "식후",
@@ -173,10 +205,15 @@ def _parse_drugs(ocr_text):
 }}
 
 규칙:
+- name에는 OCR 텍스트에 실제로 등장하는 약 이름만 넣으세요. 반환 형식의 예시 문구를 약 이름으로 복사하지 마세요.
 - 약 이름만 추출하고 병원명, 약국명, 환자명, 날짜, 주소는 제외하세요.
 - 시간은 24시간 HH:MM 형식으로 반환하세요.
 - 복용 정보가 없으면 times는 ["08:00"], meal은 "식후", gap은 "30분 후"로 설정하세요.
 - 약을 찾지 못한 경우에만 drugs를 빈 배열로 반환하세요.
+- 반드시 모든 필드 값을 한국어로 반환하세요. 영어로 반환하지 마세요.
+  예) dose: "1 tablet" (X) → "1정" (O)
+  예) meal: "after meal" (X) → "식후" (O)
+  예) gap: "30 minutes" (X) → "30분 후" (O)
 
 OCR 텍스트:
 {ocr_text}
@@ -189,6 +226,7 @@ JSON:
 
     drugs = parsed.get("drugs", [])
     for i, drug in enumerate(drugs):
+        _normalize_drug_fields(drug)
         drug["times"] = [fmt_time_korean(t) for t in drug.get("times", ["08:00"])]
         drug["color"] = COLORS[i % len(COLORS)]
         drug["enabled"] = True
@@ -545,6 +583,23 @@ async def parse_alarm(request: Request):
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.get("/api/bins")
+def get_bins(db=Depends(get_db)):
+    return [
+        {
+            "id": bin.id,
+            "district": bin.district,
+            "name": bin.name,
+            "address": bin.address,
+            "detail_location": bin.detail_location,
+            "phone": bin.phone,
+            "latitude": bin.latitude,
+            "longitude": bin.longitude,
+        }
+        for bin in db.query(DisposalBin).all()
+    ]
+
+
 @app.post("/api/analyze-image")
 async def analyze_image(image: UploadFile = File(...)):
     if not VISION_API_URL:
@@ -719,5 +774,7 @@ async def chat(request: Request):
 if __name__ == "__main__":
     import uvicorn
 
-    print("약풀 AI 서버 시작: http://localhost:5000")
-    uvicorn.run("aiServer:app", host="0.0.0.0", port=5000, reload=True)
+    host = os.getenv("HOST", "127.0.0.1")
+    port = int(os.getenv("PORT", "8000"))
+    print(f"Yakpool server starting: http://{host}:{port}")
+    uvicorn.run("aiServer:app", host=host, port=port, reload=True)
