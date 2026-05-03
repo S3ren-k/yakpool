@@ -193,13 +193,15 @@ def get_medicine_name_hints(db):
 def extract_medicine_name_with_ai(user_message, db):
     medicine_hints = "\n".join(f"- {name}" for name in get_medicine_name_hints(db))
     prompt = (
-        "사용자 질문에서 의약품 이름이라고 판단되는 부분을 가장 먼저 판별하세요.\n"
-        "아래 DB 약 목록을 참고해서 오타, 발음상 비슷한 표현, 조사 붙은 표현을 보정하세요.\n"
-        "예: '부루펜이 뭐야?' -> '부루펜'\n"
-        "예: '이브프로펜을 설명해줘' -> '이부프로펜'\n"
-        "예: '겔포스는?' -> '겔포스'\n"
-        "약 이름이 없으면 빈 문자열을 반환하세요.\n"
-        "반드시 JSON만 반환하세요.\n\n"
+        "사용자 질문에서 의약품 이름을 정확하게 추출하세요.\n"
+        "아래 DB 약 목록을 참고해서 가장 정확히 일치하는 이름을 찾으세요.\n\n"
+        "중요 규칙:\n"
+        "1. 사용자가 입력한 이름과 가장 비슷한 약 이름을 DB에서 찾으세요.\n"
+        "2. 예: '아스피린 프로텍트' → DB에서 '아스피린 프로텍트'와 가장 유사한 것 찾기 (단순 '아스피린' 아님)\n"
+        "3. 예: '부루펜이 뭐야?' → '부루펜'\n"
+        "4. 예: '이브프로펜을 설명해줘' → '이부프로펜'\n"
+        "5. 약 이름이 없으면 빈 문자열 반환\n"
+        "6. 반드시 JSON만 반환하세요.\n\n"
         "DB 약 목록:\n"
         f"{medicine_hints}\n\n"
         f"사용자 질문: {user_message}\n\n"
@@ -232,14 +234,29 @@ def find_medicine_from_db(db, message):
 
     def score(medicine):
         name = medicine.item_name or ""
+        normalized_name = normalize_medicine_text(name)
         score_value = 0
         for term in terms:
-            if term == name:
-                score_value += 100
-            elif term in name:
-                score_value += 20 + len(term)
-            elif name in message:
+            normalized_term = normalize_medicine_text(term)
+            # 완전 일치 (가장 높은 점수)
+            if normalized_term == normalized_name:
+                score_value += 200
+            # 약 이름이 검색어를 포함 (검색어가 긴 경우 더 높은 점수)
+            elif normalized_term in normalized_name:
+                score_value += 20 + len(normalized_term) * 2
+            # 검색어가 약 이름을 포함 (덜 정확한 경우)
+            elif normalized_name in normalized_term:
                 score_value += 15
+            elif name in message:
+                score_value += 10
+        
+        # 검색어와 약 이름 길이 차이가 작을수록 더 정확한 매칭 → 보너스
+        # 예: "아스피린프로텍트" vs "아스피린" 중 전자가 검색어에 더 가까움
+        search_normalized = normalize_medicine_text(" ".join(terms))
+        if search_normalized and normalized_name:
+            len_diff = abs(len(search_normalized) - len(normalized_name))
+            score_value += max(0, 30 - len_diff * 2)  # 길이 차이 작을수록 보너스
+        
         return score_value
 
     return max(candidates, key=score)
@@ -482,15 +499,14 @@ def make_db_based_ai_answer(user_message, medicine):
     system_msg = {
         "role": "system",
         "content": (
-            "당신은 '약풀' 앱의 약사 AI 챗봇입니다. "
-            "반드시 사용자가 제공한 DB 약 정보만 근거로 답하세요. "
-            "DB에 없는 효능, 복용법, 주의사항, 성분, 상호작용 정보는 추측하지 말고 "
-            "'DB에 등록된 정보만으로는 확인하기 어려워요'라고 말하세요. "
-            "이 앱은 노인 대상 약품관리 앱입니다. "
-            "진단이나 처방을 하지 말고, 위험하거나 불명확한 내용은 의사나 약사 상담을 권하세요. "
-            "DB 원문을 그대로 복사하지 말고 노인분들이 읽기 쉬운 말로 짧게 요약하세요. "
-            "전문용어는 가능한 쉬운 표현으로 바꾸고, 한 문장은 길지 않게 작성하세요. "
-            "후속 질문 버튼, ACTIONS 표기, JSON, 코드블록은 절대 출력하지 마세요."
+            "당신은 노인 대상 약품관리 앱 '약풀'의 AI 챗봇입니다. "
+            "반드시 아래 규칙을 지키세요:\n"
+            "1. 제공된 DB 정보만 사용하세요. DB에 없는 내용은 절대 추측하지 마세요.\n"
+            "2. 각 항목은 반드시 1문장으로만 작성하세요. 절대로 2문장 이상 쓰지 마세요.\n"
+            "3. 초등학생도 이해할 수 있는 쉬운 단어를 사용하세요.\n"
+            "4. 전문 의학 용어는 반드시 쉬운 말로 바꾸세요. 예: '혈전' → '피가 굳는 것', '심혈관' → '심장과 혈관'\n"
+            "5. 진단, 처방, 추천은 하지 마세요. 위험한 내용은 의사나 약사 상담을 권하세요.\n"
+            "6. ACTIONS, JSON, 코드블록, 후속 질문 버튼은 절대 출력하지 마세요."
         ),
     }
     user_msg = {
@@ -503,19 +519,16 @@ def make_db_based_ai_answer(user_message, medicine):
             f"- 복용법: {info['usage']}\n"
             f"- 주의사항: {info['warning']}\n"
             f"- 보관법: {info['storage']}\n\n"
-            "위 DB 정보만 사용해서 답변하세요. DB 원문을 그대로 길게 붙여넣지 마세요.\n"
-            "각 항목은 반드시 1문장, 길어도 최대 2문장으로 요약하세요.\n"
-            "각 항목 사이에는 빈 줄을 한 줄 넣으세요.\n"
-            "사용자가 특정 항목만 물어봐도 아래 전체 형식은 유지하되, 질문과 관련된 항목을 가장 쉽게 설명하세요.\n\n"
-            "반드시 아래 형식만 사용하세요:\n\n"
-            "[효능] : 이 약이 어디에 쓰이는지 쉬운 말로 1~2문장.\n\n"
-            "[복용법] : 언제, 얼마나 먹는지 쉬운 말로 1~2문장. DB에 정보가 복잡하면 가장 중요한 기준만 요약.\n\n"
-            "[주의사항] : 꼭 조심해야 할 내용을 쉬운 말로 1~2문장. 위험한 내용은 의사나 약사에게 확인하라고 안내.\n\n"
-            "[보관법] : 보관 방법을 쉬운 말로 1문장.\n\n"
-            "약 이름을 첫 줄에 따로 길게 쓰지 말고, 위 4개 항목만 출력하세요. ACTIONS 줄은 출력하지 마세요."
+            "아래 형식으로만 답변하세요. 각 항목은 반드시 1문장, 최대 20자 이내로 작성하세요.\n"
+            "DB 원문을 절대 그대로 복사하지 마세요. 핵심만 뽑아서 쉽게 풀어쓰세요.\n\n"
+            "[효능] : (이 약이 무엇에 쓰이는지 딱 1문장)\n\n"
+            "[복용법] : (언제, 얼마나 먹는지 딱 1문장)\n\n"
+            "[주의사항] : (가장 중요한 주의사항 딱 1문장)\n\n"
+            "[보관법] : (보관 방법 딱 1문장)\n\n"
+            "위 4개 항목만 출력하세요. 그 외 내용은 출력하지 마세요."
         ),
     }
-    return clean_chat_response(call_openai([system_msg, user_msg], max_tokens=700))
+    return clean_chat_response(call_openai([system_msg, user_msg], max_tokens=300))
 
 
 def clean_chat_response(text):
