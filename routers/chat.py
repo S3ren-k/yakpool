@@ -245,6 +245,141 @@ def find_medicine_from_db(db, message):
     return max(candidates, key=score)
 
 
+# ════════════════════════════════════════════════════════════════
+# 동일 성분 약 그룹핑
+#
+# 하이브리드 전략:
+#   1) Medicine 모델에 main_ingredient 컬럼이 있으면 그걸 우선 사용
+#   2) 없으면 item_name 괄호 안 텍스트("...(아세트아미노펜)")를 성분으로 간주
+# 나중에 main_ingredient 컬럼을 추가해 채워넣으면 자동으로 1번 경로로 전환됨.
+# ════════════════════════════════════════════════════════════════
+
+
+def normalize_ingredient_name(text):
+    """성분명 정규화 — 공백 제거."""
+    return re.sub(r"\s+", "", (text or "")).strip()
+
+
+def get_medicine_ingredient(medicine):
+    """약 객체에서 주성분명을 뽑아낸다.
+
+    우선순위:
+      1) medicine.main_ingredient 속성이 있고 값이 있으면 그것
+      2) item_name의 마지막 괄호 안 텍스트
+      3) 추출 실패 시 빈 문자열
+    """
+    direct = getattr(medicine, "main_ingredient", None)
+    if direct and str(direct).strip():
+        return normalize_ingredient_name(str(direct))
+
+    name = medicine.item_name or ""
+    matches = re.findall(r"\(([^()]+)\)", name)
+    if matches:
+        # 마지막 괄호 (보통 성분명이 마지막에 옴)
+        return normalize_ingredient_name(matches[-1])
+
+    return ""
+
+
+def find_medicines_by_ingredient(db, ingredient_query, limit=20):
+    """주성분명으로 약 목록을 조회한다."""
+    if not ingredient_query or not ingredient_query.strip():
+        return []
+
+    target = normalize_ingredient_name(ingredient_query)
+    if not target:
+        return []
+
+    # 1단계: main_ingredient 컬럼이 있으면 직접 필터링 (빠른 경로)
+    if hasattr(Medicine, "main_ingredient"):
+        try:
+            results = (
+                db.query(Medicine)
+                .filter(Medicine.main_ingredient.ilike(f"%{ingredient_query}%"))
+                .limit(limit)
+                .all()
+            )
+            if results:
+                return results
+        except Exception:
+            # 컬럼이 모델엔 있지만 DB 마이그레이션이 안 됐다면 조용히 fallback
+            pass
+
+    # 2단계: item_name 괄호 텍스트 fallback
+    candidates = (
+        db.query(Medicine)
+        .filter(
+            or_(
+                Medicine.item_name.ilike(f"%({ingredient_query}%"),
+                Medicine.item_name.ilike(f"%{ingredient_query})%"),
+                Medicine.item_name.ilike(f"%{ingredient_query}%"),
+            )
+        )
+        .limit(limit * 3)
+        .all()
+    )
+
+    # 후처리: 실제로 괄호 안에 성분이 들어있는 약만 남김
+    matched = []
+    seen_seqs = set()
+    for m in candidates:
+        if m.item_seq in seen_seqs:
+            continue
+        ing = get_medicine_ingredient(m)
+        if not ing:
+            continue
+        if target in ing or ing in target:
+            matched.append(m)
+            seen_seqs.add(m.item_seq)
+        if len(matched) >= limit:
+            break
+
+    return matched
+
+
+def find_ingredient_from_query(db, query):
+    """사용자 검색어로부터 성분명을 추출한다.
+
+    Returns: (성분명, 추출 경로) 또는 (None, None)
+    """
+    if not query or not query.strip():
+        return None, None
+
+    cleaned = clean_search_term(query)
+    if not cleaned:
+        return None, None
+
+    # 경로 1: 검색어가 성분명일 가능성
+    direct_hits = find_medicines_by_ingredient(db, cleaned, limit=2)
+    if direct_hits:
+        ing = get_medicine_ingredient(direct_hits[0])
+        if ing:
+            return ing, "direct_ingredient_match"
+
+    # 경로 2: 검색어가 제품명 — 약을 찾아 그 성분을 가져온다
+    medicine = find_medicine_from_db(db, cleaned)
+    if medicine:
+        ing = get_medicine_ingredient(medicine)
+        if ing:
+            return ing, "via_product_name"
+
+    return None, None
+
+
+def medicine_to_list_item(medicine):
+    """동일 성분 리스트용 간략 직렬화."""
+    company = (
+        getattr(medicine, "entp_name", "") or getattr(medicine, "company", "") or ""
+    )
+    return {
+        "item_seq": medicine.item_seq,
+        "name": medicine.item_name or "",
+        "image_url": medicine.image_url or "",
+        "company": company,
+        "ingredient": get_medicine_ingredient(medicine),
+    }
+
+
 def find_medicine_for_question(db, user_message):
     extracted_name = ""
     try:
@@ -799,6 +934,77 @@ async def chat(request: Request, db: Session = Depends(get_db)):
         "source": "openai_with_db",
         "extracted_medicine_name": extracted_name,
         "medicine": medicine_to_context(medicine),
+    }
+
+
+@router.get("/medicines-by-ingredient")
+async def medicines_by_ingredient(request: Request, db: Session = Depends(get_db)):
+    """동일 성분 약 리스트 조회.
+
+    Query params:
+      - query (required): 약 이름 또는 성분명 (예: "타이레놀", "아세트아미노펜")
+      - limit (optional, default=10): 반환할 최대 약 개수 (1~30)
+
+    Response (성공):
+      {
+        "ingredient": "아세트아미노펜",
+        "medicines": [
+          {
+            "item_seq": "...",
+            "name": "타이레놀정500밀리그람(아세트아미노펜)",
+            "image_url": "https://...",
+            "company": "",
+            "ingredient": "아세트아미노펜"
+          },
+          ...
+        ],
+        "query": "타이레놀",
+        "source": "direct_ingredient_match" | "via_product_name"
+      }
+
+    Response (빈 결과):
+      성분 식별 실패 또는 동일 성분 약이 1개 이하인 경우:
+        { "ingredient": "...", "medicines": [], "query": "...", "source": "no_match" | "single_or_none" }
+      프론트는 이때 일반 단일 약 응답 흐름으로 처리하면 됨.
+    """
+    query = (request.query_params.get("query") or "").strip()
+    try:
+        limit = int(request.query_params.get("limit") or 10)
+    except ValueError:
+        limit = 10
+    limit = max(1, min(limit, 30))
+
+    if not query:
+        return JSONResponse(
+            {"error": "query 파라미터가 필요합니다."},
+            status_code=400,
+        )
+
+    ingredient, source = find_ingredient_from_query(db, query)
+    if not ingredient:
+        return {
+            "ingredient": "",
+            "medicines": [],
+            "query": query,
+            "source": "no_match",
+        }
+
+    medicines = find_medicines_by_ingredient(db, ingredient, limit=limit)
+
+    # 1개 이하면 동일 성분 리스트로 보여줄 의미가 적음 → 프론트가 일반 흐름으로 처리하도록 빈 리스트
+    if len(medicines) <= 1:
+        return {
+            "ingredient": ingredient,
+            "medicines": [],
+            "query": query,
+            "source": "single_or_none",
+        }
+
+    return {
+        "ingredient": ingredient,
+        "medicines": [medicine_to_list_item(m) for m in medicines],
+        "query": query,
+        "source": source or "ingredient_lookup",
     }
 
 
