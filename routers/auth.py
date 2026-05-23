@@ -15,7 +15,7 @@ ALGORITHM              = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
 
 KAKAO_REST_API_KEY = "5832230ea366fd30f92d10578a672711"
-KAKAO_REDIRECT_URI = "http://localhost:3000/kakao/callback"
+KAKAO_REDIRECT_URI = "https://yakpool-fe-p.vercel.app/kakao/callback"
 
 
 # ── DB 의존성 ────────────────────────────────────────────

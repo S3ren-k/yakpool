@@ -9,7 +9,12 @@ backend_dir = Path(__file__).resolve().parents[1]
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
-from routers import bins, chat, drug
+from routers import bins, chat, drug, auth
+import user_db
+
+@app.on.event("startup")
+def startup():
+    user_db.init_user_db()
 
 
 app = FastAPI()
