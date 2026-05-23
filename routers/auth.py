@@ -1,3 +1,4 @@
+import os
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -9,9 +10,9 @@ import user_db
 
 router = APIRouter(tags=["회원관리"])
 
-# ── 설정값 ──────────────────────────────────────────────
-SECRET_KEY             = "yakpool_secret_key_change_later"  # 배포 전 반드시 변경!
-ALGORITHM              = "HS256"
+# ── 설정값 (환경변수에서 읽어옴) ─────────────────────────
+SECRET_KEY               = os.getenv("SECRET_KEY", "yakpool_secret_key_change_later")
+ALGORITHM                = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
 
 KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY", "")
@@ -110,16 +111,16 @@ def login(req: LoginRequest, db: Session = Depends(get_user_db)):
     if not user_db.pwd_context.verify(req.password, db_user.hashed_password):
         raise HTTPException(status_code=400, detail="비밀번호가 틀렸습니다.")
 
-    expire_days   = 30 if req.keep_login else 1
-    access_token  = create_access_token(
+    expire_days  = 30 if req.keep_login else 1
+    access_token = create_access_token(
         {"sub": db_user.username, "user_id": db_user.id},
         days=expire_days,
     )
     return {
-        "상태":           "성공",
-        "메시지":         "로그인 성공",
-        "access_token":   access_token,
-        "token_type":     "bearer",
+        "상태":            "성공",
+        "메시지":          "로그인 성공",
+        "access_token":    access_token,
+        "token_type":      "bearer",
         "expires_in_days": expire_days,
         "user": {
             "id":         db_user.id,
@@ -135,6 +136,9 @@ def login(req: LoginRequest, db: Session = Depends(get_user_db)):
 @router.post("/kakao-login")
 def kakao_login(req: KakaoLoginRequest, db: Session = Depends(get_user_db)):
     """카카오 소셜 로그인"""
+    if not KAKAO_REST_API_KEY:
+        raise HTTPException(status_code=500, detail="카카오 API 키가 설정되지 않았습니다.")
+
     # 1. 카카오 액세스 토큰 발급
     token_res = http_requests.post(
         "https://kauth.kakao.com/oauth/token",
@@ -147,7 +151,7 @@ def kakao_login(req: KakaoLoginRequest, db: Session = Depends(get_user_db)):
     )
     token_json = token_res.json()
     if "access_token" not in token_json:
-        raise HTTPException(status_code=400, detail="카카오 토큰 발급 실패")
+        raise HTTPException(status_code=400, detail=f"카카오 토큰 발급 실패: {token_json.get('error_description', '')}")
 
     # 2. 카카오 사용자 정보 조회
     user_res  = http_requests.get(
