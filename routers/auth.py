@@ -14,7 +14,7 @@ SECRET_KEY             = "yakpool_secret_key_change_later"  # 배포 전 반드�
 ALGORITHM              = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
 
-KAKAO_REST_API_KEY = "2a024bfa82b5b99d9df7a95b232069e1"
+KAKAO_REST_API_KEY = os.getenv("KAKAO_REST_API_KEY", "")
 KAKAO_REDIRECT_URI = "https://yakpool-fe-p.vercel.app/kakao/callback"
 
 
