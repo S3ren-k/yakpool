@@ -6,3 +6,5 @@ requests
 sqlalchemy
 google-cloud-speech
 google-cloud-texttospeech
+python-jose[cryptography]
+passlib[bcrypt]
